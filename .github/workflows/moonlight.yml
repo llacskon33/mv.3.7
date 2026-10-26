@@ -1,0 +1,171 @@
+name: Moonlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Minutos que se mantiene activa la sesión (máx. 350)"
+        type: number
+        default: 240
+
+permissions:
+  contents: read
+
+jobs:
+  moonlight:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Set up Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          $ip = ""
+          if (-not $env:TS_AUTHKEY) {
+              Write-Host "::error::Falta el secreto TS_AUTHKEY."
+              exit 1
+          }
+
+          $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+                            -OutFile $msi -UseBasicParsing -TimeoutSec 120
+          $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait -PassThru
+          Write-Host "Instalación de Tailscale: exit $($p.ExitCode)"
+
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          for ($i = 0; $i -lt 15 -and -not (Test-Path $ts); $i++) { Start-Sleep 2 }
+          if (-not (Test-Path $ts)) { Write-Host "::error::tailscale.exe no encontrado."; exit 1 }
+
+          $up = $false
+          for ($i = 1; $i -le 6 -and -not $up; $i++) {
+              & $ts up --auth-key="$env:TS_AUTHKEY" --hostname="moonlight-$($env:GITHUB_RUN_ID)" 2>&1 | Write-Host
+              if ($LASTEXITCODE -eq 0) { $up = $true } else { Start-Sleep 8 }
+          }
+          if (-not $up) { Write-Host "::error::'tailscale up' falló."; exit 1 }
+
+          $ip = ((& $ts ip -4) | Select-Object -First 1).Trim()
+          Write-Host "Tailscale conectado. IP: $ip"
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $global:LASTEXITCODE = 0
+
+      - name: Install Sunshine
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUNSHINE_PASSWORD: ${{ secrets.SUNSHINE_PASSWORD }}
+        run: |
+          $sunDir = "C:\Program Files\Sunshine"
+          $sunExe = Join-Path $sunDir "sunshine.exe"
+
+          # 1) Buscar e instalar el instalador AMD64 (.msi preferido, .exe como alternativa)
+          try {
+              $rels = Invoke-RestMethod "https://api.github.com/repos/LizardByte/Sunshine/releases?per_page=15" `
+                          -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gha-moonlight" }
+              $asset = $null; $tag = ""
+              foreach ($pre in @($false, $true)) {
+                  foreach ($r in ($rels | Where-Object { -not $_.draft -and ($_.prerelease -eq $pre) })) {
+                      $cand = $r.assets |
+                              Where-Object { $_.name -match '^Sunshine-Windows-AMD64-installer\.(msi|exe)$' } |
+                              Sort-Object { $_.name -notlike '*.msi' } | Select-Object -First 1
+                      if ($cand) { $asset = $cand; $tag = $r.tag_name; break }
+                  }
+                  if ($asset) { break }
+              }
+              if (-not $asset) {
+                  Write-Host "Assets de la release más reciente: $(($rels[0].assets.name) -join ', ')"
+                  throw "No se encontró el instalador de Windows AMD64."
+              }
+
+              $file = Join-Path $env:RUNNER_TEMP $asset.name
+              Write-Host "Descargando $($asset.name) ($tag)"
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $file -UseBasicParsing -TimeoutSec 300
+              if ($asset.name -like '*.msi') {
+                  $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$file`"", "/qn", "/norestart" -Wait -PassThru
+              } else {
+                  $p = Start-Process $file -ArgumentList "/S" -Wait -PassThru
+              }
+              Write-Host "Instalación de Sunshine: exit $($p.ExitCode)"
+          } catch {
+              Write-Host "::error::No se pudo instalar Sunshine: $($_.Exception.Message)"
+              exit 1
+          }
+
+          if (-not (Test-Path $sunExe)) {
+              $found = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter sunshine.exe -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+              if ($found) { $sunExe = $found.FullName; $sunDir = $found.DirectoryName }
+          }
+          if (-not (Test-Path $sunExe)) { Write-Host "::error::sunshine.exe no encontrado."; exit 1 }
+
+          # 2) Contraseña de la web: la del secreto SUNSHINE_PASSWORD si existe; si no, aleatoria
+          $svc = (Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*unshine*' } | Select-Object -First 1).Name
+          Write-Host "Servicio de Sunshine: $svc"
+          if ($svc) { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue }
+
+          $generated = $false
+          $pw = $env:SUNSHINE_PASSWORD
+          if (-not $pw) {
+              $pw = -join (((48..57) + (65..90) + (97..122)) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
+              $generated = $true
+          }
+          Push-Location $sunDir
+          & $sunExe --creds sunshine $pw 2>&1 | Write-Host
+          Pop-Location
+          if ($generated) { "SUNSHINE_PW=$pw" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
+
+          # 3) Firewall: solo desde Tailscale
+          netsh advfirewall firewall delete rule name="Sunshine" | Out-Null
+          netsh advfirewall firewall delete rule name="Sunshine-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="Sunshine-Tailscale" `
+            dir=in action=allow protocol=any program="$sunExe" remoteip=100.64.0.0/10 | Out-Null
+
+          # 4) Arrancar y diagnosticar
+          if ($svc) { Start-Service -Name $svc -ErrorAction SilentlyContinue }
+          Start-Sleep -Seconds 8
+          if ($svc) { Get-Service $svc -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String | Write-Host }
+
+          Write-Host "===== Sesiones de usuario ====="
+          query user 2>&1 | Write-Host
+          query session 2>&1 | Write-Host
+
+          $log = Join-Path $sunDir "config\sunshine.log"
+          if (Test-Path $log) {
+              Write-Host "===== sunshine.log (últimas 40 líneas) ====="
+              Get-Content $log -Tail 40 | Write-Host
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Show connection info
+        shell: pwsh
+        run: |
+          $out = $env:GITHUB_STEP_SUMMARY
+          "## Conexión desde el móvil (Moonlight)" | Out-File $out -Append -Encoding utf8
+          "1. En el móvil, abre **Tailscale** (misma cuenta) y deja la VPN activa." | Out-File $out -Append -Encoding utf8
+          "2. En **Moonlight**, añade el equipo a mano con la IP ``$($env:TS_IP)``." | Out-File $out -Append -Encoding utf8
+          "3. Moonlight mostrará un PIN: introdúcelo en ``https://$($env:TS_IP):47990/pin`` (acepta el aviso del certificado)." | Out-File $out -Append -Encoding utf8
+          "4. Abre **Desktop**." | Out-File $out -Append -Encoding utf8
+          "- Usuario web: ``sunshine``" | Out-File $out -Append -Encoding utf8
+          if ($env:SUNSHINE_PW) {
+              "- Contraseña web:" | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+              $env:SUNSHINE_PW | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+          } else {
+              "- Contraseña web: la del secreto ``SUNSHINE_PASSWORD``." | Out-File $out -Append -Encoding utf8
+          }
+          Write-Host "Datos de conexión escritos en el resumen del paso."
+
+      - name: Keep session alive
+        shell: pwsh
+        env:
+          MINUTOS: ${{ inputs.minutos }}
+        run: |
+          $min = 0; [void][int]::TryParse("$env:MINUTOS", [ref]$min)
+          if ($min -lt 1)   { $min = 1 }
+          if ($min -gt 350) { $min = 350 }
+          $deadline = (Get-Date).AddMinutes($min)
+          Write-Host ("Sesión activa hasta {0:HH:mm:ss} ({1} min). Cancela el workflow para terminar antes." -f $deadline, $min)
+          while ((Get-Date) -lt $deadline) { Start-Sleep -Seconds 60 }
+          Write-Host "Plazo cumplido."
