@@ -497,23 +497,44 @@ jobs:
         run: |
           $sunDir = "C:\Program Files\Sunshine"
           $sunExe = Join-Path $sunDir "sunshine.exe"
-          $installer = Join-Path $env:RUNNER_TEMP "sunshine-installer.exe"
 
-          # 1) Descargar e instalar la última versión
+          # 1) Buscar el instalador AMD64 (.msi preferido, .exe como alternativa) en las últimas releases
           try {
-              $rel = Invoke-RestMethod "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" `
-                         -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gha-rdp" }
-              $asset = $rel.assets | Where-Object {
-                  $_.name -like "*.exe" -and $_.name -match 'win' -and $_.name -match 'install' -and $_.name -notmatch 'arm'
-              } | Select-Object -First 1
-              if (-not $asset) { throw "No se encontró el instalador de Windows en la última release." }
+              $rels = Invoke-RestMethod "https://api.github.com/repos/LizardByte/Sunshine/releases?per_page=15" `
+                          -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gha-rdp" }
+              $asset = $null; $tag = ""
+              foreach ($pre in @($false, $true)) {
+                  foreach ($r in ($rels | Where-Object { -not $_.draft -and ($_.prerelease -eq $pre) })) {
+                      $cand = $r.assets |
+                              Where-Object { $_.name -match '^Sunshine-Windows-AMD64-installer\.(msi|exe)$' } |
+                              Sort-Object { $_.name -notlike '*.msi' } | Select-Object -First 1
+                      if ($cand) { $asset = $cand; $tag = $r.tag_name; break }
+                  }
+                  if ($asset) { break }
+              }
+              if (-not $asset) {
+                  Write-Host "Assets de la release más reciente: $(($rels[0].assets.name) -join ', ')"
+                  throw "No se encontró el instalador de Windows AMD64 en las últimas releases."
+              }
 
-              Write-Host "Descargando $($asset.name) ($($rel.tag_name))"
-              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing -TimeoutSec 300
-              $p = Start-Process $installer -ArgumentList "/S" -Wait -PassThru
+              $file = Join-Path $env:RUNNER_TEMP $asset.name
+              Write-Host "Descargando $($asset.name) ($tag)"
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $file -UseBasicParsing -TimeoutSec 300
+              if ($asset.name -like '*.msi') {
+                  $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$file`"", "/qn", "/norestart" -Wait -PassThru
+              } else {
+                  $p = Start-Process $file -ArgumentList "/S" -Wait -PassThru
+              }
               Write-Host "Instalación de Sunshine: exit $($p.ExitCode)"
           } catch {
               Write-Host "::warning::No se pudo instalar Sunshine: $($_.Exception.Message)"
+          }
+
+          # Localizar sunshine.exe si no está en la ruta habitual
+          if (-not (Test-Path $sunExe)) {
+              $found = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter sunshine.exe -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+              if ($found) { $sunExe = $found.FullName; $sunDir = $found.DirectoryName }
           }
 
           if (-not (Test-Path $sunExe)) {
@@ -524,7 +545,9 @@ jobs:
           }
 
           # 2) Parar el servicio y restaurar la configuración guardada (móviles ya emparejados)
-          Stop-Service -Name SunshineService -Force -ErrorAction SilentlyContinue
+          $svc = (Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*unshine*' } | Select-Object -First 1).Name
+          Write-Host "Servicio de Sunshine: $svc"
+          if ($svc) { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue }
           $saved = "C:\Datos\.apps\sunshine-config"
           if (Test-Path $saved) {
               Write-Host "Restaurando configuración de Sunshine..."
@@ -547,9 +570,9 @@ jobs:
             dir=in action=allow protocol=any program="$sunExe" remoteip=100.64.0.0/10 | Out-Null
 
           # 5) Arrancar y mostrar diagnóstico
-          Start-Service -Name SunshineService -ErrorAction SilentlyContinue
+          if ($svc) { Start-Service -Name $svc -ErrorAction SilentlyContinue }
           Start-Sleep -Seconds 8
-          Get-Service SunshineService -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String | Write-Host
+          if ($svc) { Get-Service $svc -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String | Write-Host }
           $log = Join-Path $sunDir "config\sunshine.log"
           if (Test-Path $log) {
               Write-Host "===== sunshine.log (últimas 40 líneas) ====="
