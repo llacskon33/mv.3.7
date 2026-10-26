@@ -7,6 +7,10 @@ on:
         description: "Listar apps instaladas y carpetas pesadas al inicio"
         type: boolean
         default: false
+      sunshine:
+        description: "Instalar Sunshine (streaming para conectar con Moonlight desde el móvil)"
+        type: boolean
+        default: true
       minutos:
         description: "Minutos activa antes de la copia final (máx. 315)"
         type: number
@@ -133,6 +137,9 @@ jobs:
               }
           }
           $lines += Get-ChildItem "C:\Program Files","C:\Program Files (x86)","C:\ProgramData\chocolatey\lib" -Directory -Name -ErrorAction SilentlyContinue
+          # Sunshine: si cambia el estado (nuevos móviles emparejados), cuenta como cambio
+          $sunState = "C:\Program Files\Sunshine\config\sunshine_state.json"
+          if (Test-Path $sunState) { $lines += "sunshine|" + (Get-FileHash $sunState -Algorithm SHA256).Hash }
           $sha = [System.Security.Cryptography.SHA256]::Create()
           $sig = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))))
           if ((Test-Path "C:\last-sig.txt") -and ((Get-Content "C:\last-sig.txt" -Raw).Trim() -eq $sig)) {
@@ -160,7 +167,7 @@ jobs:
               Remove-Item $dstRoot -Recurse -Force -ErrorAction SilentlyContinue
               $base = @(Get-Content $baseFile)
               Get-ChildItem $srcRoot -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notin $base -and $_.Name -ne 'Tailscale' } |
+                Where-Object { $_.Name -notin $base -and $_.Name -ne 'Tailscale' -and $_.Name -ne 'Sunshine' } |
                 ForEach-Object { Copy-Capped $_.FullName (Join-Path $dstRoot $_.Name) }
           }
 
@@ -198,6 +205,13 @@ jobs:
           }
           if (Get-Command winget -ErrorAction SilentlyContinue) {
               winget export -o "$appsDir\winget-packages.json" --include-versions 2>$null | Out-Null
+          }
+
+          # Guardar configuración de Sunshine (móviles emparejados, claves, ajustes)
+          $sunCfg = "C:\Program Files\Sunshine\config"
+          if (Test-Path $sunCfg) {
+              robocopy $sunCfg "$appsDir\sunshine-config" /E /XF "*.log" /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+              $global:LASTEXITCODE = 0
           }
 
           $dst = "D:\_rdp_backup"
@@ -475,6 +489,74 @@ jobs:
           Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
           $global:LASTEXITCODE = 0
 
+      - name: Install Sunshine (streaming para Moonlight)
+        if: ${{ inputs.sunshine }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sunDir = "C:\Program Files\Sunshine"
+          $sunExe = Join-Path $sunDir "sunshine.exe"
+          $installer = Join-Path $env:RUNNER_TEMP "sunshine-installer.exe"
+
+          # 1) Descargar e instalar la última versión
+          try {
+              $rel = Invoke-RestMethod "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" `
+                         -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gha-rdp" }
+              $asset = $rel.assets | Where-Object {
+                  $_.name -like "*.exe" -and $_.name -match 'win' -and $_.name -match 'install' -and $_.name -notmatch 'arm'
+              } | Select-Object -First 1
+              if (-not $asset) { throw "No se encontró el instalador de Windows en la última release." }
+
+              Write-Host "Descargando $($asset.name) ($($rel.tag_name))"
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing -TimeoutSec 300
+              $p = Start-Process $installer -ArgumentList "/S" -Wait -PassThru
+              Write-Host "Instalación de Sunshine: exit $($p.ExitCode)"
+          } catch {
+              Write-Host "::warning::No se pudo instalar Sunshine: $($_.Exception.Message)"
+          }
+
+          if (-not (Test-Path $sunExe)) {
+              Write-Host "::warning::sunshine.exe no encontrado: se omite Sunshine."
+              "SUNSHINE_OK=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              $global:LASTEXITCODE = 0
+              exit 0
+          }
+
+          # 2) Parar el servicio y restaurar la configuración guardada (móviles ya emparejados)
+          Stop-Service -Name SunshineService -Force -ErrorAction SilentlyContinue
+          $saved = "C:\Datos\.apps\sunshine-config"
+          if (Test-Path $saved) {
+              Write-Host "Restaurando configuración de Sunshine..."
+              robocopy $saved (Join-Path $sunDir "config") /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+              $global:LASTEXITCODE = 0
+          }
+
+          # 3) Credenciales nuevas para la web de administración (solo alfanuméricas)
+          $pw = -join (((48..57) + (65..90) + (97..122)) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
+          Push-Location $sunDir
+          & $sunExe --creds sunshine $pw 2>&1 | Write-Host
+          Pop-Location
+          "SUNSHINE_PW=$pw" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SUNSHINE_OK=1"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # 4) Firewall: quitar reglas abiertas del instalador y permitir solo Tailscale
+          netsh advfirewall firewall delete rule name="Sunshine" | Out-Null
+          netsh advfirewall firewall delete rule name="Sunshine-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="Sunshine-Tailscale" `
+            dir=in action=allow protocol=any program="$sunExe" remoteip=100.64.0.0/10 | Out-Null
+
+          # 5) Arrancar y mostrar diagnóstico
+          Start-Service -Name SunshineService -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 8
+          Get-Service SunshineService -ErrorAction SilentlyContinue | Format-Table Name, Status | Out-String | Write-Host
+          $log = Join-Path $sunDir "config\sunshine.log"
+          if (Test-Path $log) {
+              Write-Host "===== sunshine.log (últimas 40 líneas) ====="
+              Get-Content $log -Tail 40 | Write-Host
+          }
+          $global:LASTEXITCODE = 0
+
       - name: Set up Tailscale
         shell: pwsh
         env:
@@ -550,6 +632,25 @@ jobs:
           }
           "- La sesión termina sola al llegar al plazo: conecta cuanto antes." |
             Out-File $out -Append -Encoding utf8
+
+          if ($env:SUNSHINE_OK -eq "1") {
+              "`n## Conexión desde el móvil (Sunshine + Moonlight)" | Out-File $out -Append -Encoding utf8
+              if ($env:TS_IP) {
+                  "- En el móvil: instala **Tailscale** (misma cuenta/red) y **Moonlight**." | Out-File $out -Append -Encoding utf8
+                  "- Moonlight → añadir equipo manualmente → IP ``$($env:TS_IP)``." | Out-File $out -Append -Encoding utf8
+                  "- Moonlight mostrará un PIN: introdúcelo en ``https://$($env:TS_IP):47990/pin`` (acepta el aviso del certificado)." | Out-File $out -Append -Encoding utf8
+                  "- Web de administración: ``https://$($env:TS_IP):47990``" | Out-File $out -Append -Encoding utf8
+              } else {
+                  "- Sin IP de Tailscale no hay forma de llegar a Sunshine." | Out-File $out -Append -Encoding utf8
+              }
+              "- Usuario web: ``sunshine``" | Out-File $out -Append -Encoding utf8
+              "- Contraseña web:" | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+              $env:SUNSHINE_PW | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+              "- Si usas Moonlight, no tengas a la vez una sesión RDP abierta: Sunshine no puede capturar sesiones RDP." |
+                Out-File $out -Append -Encoding utf8
+          }
 
           Write-Host "Datos de conexión escritos en el resumen del paso."
 
