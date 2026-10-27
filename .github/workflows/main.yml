@@ -6,7 +6,7 @@ on:
       iso_url:
         description: "URL directa del ISO de BlissOS (x86_64)"
         type: string
-        default: "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-opengapps-20241218.iso/download"
+        default: "https://sourceforge.net/projects/blissos-x86/files/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso/download"
       minutos:
         description: "Minutos activa antes de la copia final (máx. 315)"
         type: number
@@ -59,8 +59,18 @@ jobs:
       - name: Descargar ISO y restaurar disco
         run: |
           mkdir -p "$HOME/bliss" && cd "$HOME/bliss"
-          curl -L --fail --retry 3 -o bliss.iso "${{ inputs.iso_url }}"
+          ISO_URL="${{ inputs.iso_url }}"
+          # Si la URL principal falla, prueba un mirror directo de SourceForge
+          curl -L --fail --retry 3 -A "Mozilla/5.0" -o bliss.iso "$ISO_URL" \
+            || curl -L --fail --retry 3 -A "Mozilla/5.0" -o bliss.iso \
+                 "https://cytranet-dal.dl.sourceforge.net/project/blissos-x86/Official/BlissOS16/Gapps/Generic/Bliss-v16.9.7-x86_64-OFFICIAL-gapps-20241011.iso?viasf=1"
           ls -lh bliss.iso
+          # Un ISO real pesa ~2 GB; si es mucho menor, es una página HTML de error
+          SIZE=$(stat -c%s bliss.iso)
+          if [ "$SIZE" -lt 1000000000 ]; then
+            echo "::error::El ISO descargado pesa solo $SIZE bytes: la URL no es válida."
+            head -c 300 bliss.iso; exit 1
+          fi
 
           TAG=""
           for t in $(gh release list --limit 100 --json tagName,createdAt \
