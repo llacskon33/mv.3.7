@@ -827,10 +827,10 @@ jobs:
 
           function Invoke-Backup {
               Write-Host ("{0:HH:mm:ss} Ejecutando copia de seguridad..." -f (Get-Date))
-              & pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\backup.ps1"
+              & pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\backup.ps1" | Out-Host
               $ec = $LASTEXITCODE
               if ($null -eq $ec) { $ec = 0 }
-              return $ec
+              return [int]$ec
           }
 
           $lastBackup = $start
