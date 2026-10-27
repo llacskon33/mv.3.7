@@ -178,22 +178,23 @@ jobs:
                 ForEach-Object { Copy-Capped $_.FullName (Join-Path $dstRoot $_.Name) }
           }
 
-          # Exporta la configuración (HKCU\Software) del usuario RDP, esté o no conectado.
-          # Antes se exportaba HKCU del usuario del runner, que no es el usuario RDP.
-          function Save-RdpRegistry($dstDir) {
+          # Exporta una rama del registro del usuario RDP (HKCU\<sub>), esté o no conectado.
+          # Por defecto exporta HKCU\Software; también se usa para "Control Panel\Desktop"
+          # (imagen de fondo y ajustes de pantalla) y "Control Panel\Colors".
+          function Save-RdpRegistry($dstDir, $sub = "Software", $name = "rdp-software.reg") {
               $u = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
               if (-not $u) { return }
               $sid = $u.SID.Value
-              $tmp = Join-Path $env:TEMP "rdp-software.reg"
+              $tmp = Join-Path $env:TEMP $name
               Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-              $key = "HKU\$sid\Software"
+              $key = "HKU\$sid\$sub"
               $prefixReg = "HKEY_USERS\$sid"
               $mounted = $false
               if (-not (Test-Path "Registry::HKEY_USERS\$sid")) {
                   $nt = "C:\Users\RDP\NTUSER.DAT"
                   if (Test-Path $nt) {
                       reg load HKU\RDP_TMP $nt 2>$null | Out-Null
-                      if ($LASTEXITCODE -eq 0) { $mounted = $true; $key = "HKU\RDP_TMP\Software"; $prefixReg = "HKEY_USERS\RDP_TMP" }
+                      if ($LASTEXITCODE -eq 0) { $mounted = $true; $key = "HKU\RDP_TMP\$sub"; $prefixReg = "HKEY_USERS\RDP_TMP" }
                   }
               }
               reg export $key $tmp /y 2>$null | Out-Null
@@ -203,11 +204,11 @@ jobs:
                   $txt = [IO.File]::ReadAllText($tmp, [Text.Encoding]::Unicode)
                   $txt = $txt.Replace($prefixReg, "HKEY_USERS\RDP_RESTORE")
                   New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
-                  [IO.File]::WriteAllText((Join-Path $dstDir "rdp-software.reg"), $txt, [Text.Encoding]::Unicode)
+                  [IO.File]::WriteAllText((Join-Path $dstDir $name), $txt, [Text.Encoding]::Unicode)
                   Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-                  Write-Host "[backup] Configuración del usuario RDP guardada."
+                  Write-Host "[backup] Guardado del registro del usuario RDP: $sub"
               } else {
-                  Write-Host "[backup] No se pudo exportar la configuración del usuario RDP."
+                  Write-Host "[backup] No se pudo exportar del usuario RDP: $sub"
               }
               $global:LASTEXITCODE = 0
           }
@@ -254,8 +255,16 @@ jobs:
                 Set-Content "$appsDir\programas-instalados.txt"
           }
 
-          # Guardar configuración del usuario RDP y lista de paquetes winget
+          # Guardar configuración del usuario RDP (programas, imagen de fondo y colores) y lista de paquetes winget
           Save-RdpRegistry "$appsDir\registry"
+          Save-RdpRegistry "$appsDir\registry" "Control Panel\Desktop" "rdp-desktop.reg"
+          Save-RdpRegistry "$appsDir\registry" "Control Panel\Colors"  "rdp-colors.reg"
+          # SID del usuario RDP: al restaurar se compara para saber si las sesiones cifradas (DPAPI) pueden funcionar
+          $uSid = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($uSid) {
+              New-Item -ItemType Directory -Path "$appsDir\registry" -Force | Out-Null
+              $uSid.SID.Value | Set-Content "$appsDir\registry\rdp-sid.txt"
+          }
           if (Get-Command winget -ErrorAction SilentlyContinue) {
               winget export -o "$appsDir\winget-packages.json" --include-versions 2>$null | Out-Null
           }
@@ -392,20 +401,31 @@ jobs:
 
       - name: Create RDP User
         shell: pwsh
+        env:
+          # Opcional: si defines el secreto RDP_PASSWORD se usa esa contraseña fija
+          # (necesario para que las sesiones cifradas con DPAPI puedan sobrevivir entre ejecuciones).
+          # Debe cumplir la complejidad de Windows. Si no existe, se genera una aleatoria.
+          RDP_PASSWORD_FIXED: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $charSet = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
+          $fixed = $env:RDP_PASSWORD_FIXED
+          if ($fixed) {
+              $password = $fixed
+              "RDP_PW_FIXED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+              $charSet = @{
+                  Upper = [char[]](65..90)
+                  Lower = [char[]](97..122)
+                  Number = [char[]](48..57)
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
@@ -417,15 +437,18 @@ jobs:
               exit 1
           }
 
-          $password | Set-Content -Path "C:\rdp-password.txt" -Encoding utf8 -NoNewline
-
           $out = $env:GITHUB_STEP_SUMMARY
           "## Conexión RDP (generada en este paso)" | Out-File $out -Append -Encoding utf8
           "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
-          "- Contraseña:" | Out-File $out -Append -Encoding utf8
-          '````' | Out-File $out -Append -Encoding utf8
-          $password | Out-File $out -Append -Encoding utf8
-          '````' | Out-File $out -Append -Encoding utf8
+          if ($fixed) {
+              "- Contraseña: la que guardaste en el secreto ``RDP_PASSWORD``" | Out-File $out -Append -Encoding utf8
+          } else {
+              $password | Set-Content -Path "C:\rdp-password.txt" -Encoding utf8 -NoNewline
+              "- Contraseña:" | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+              $password | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+          }
 
           "RDP_PASSWORD_GEN<<RDP_PASSWORD_EOF_7f3a9b2c" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $password | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -575,16 +598,34 @@ jobs:
               $global:LASTEXITCODE = 0
           }
 
-          # Configuración del usuario RDP: se carga su NTUSER.DAT y se importa HKCU\Software
-          $regFile = "C:\Datos\.apps\registry\rdp-software.reg"
+          # Aviso sobre sesiones cifradas (DPAPI): solo pueden funcionar si el SID del usuario RDP no ha cambiado
+          $sidFile = "C:\Datos\.apps\registry\rdp-sid.txt"
+          if ($restoreOk -and (Test-Path $sidFile)) {
+              $oldSid = (Get-Content $sidFile -Raw).Trim()
+              $newSid = (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue).SID.Value
+              if ($oldSid -ne $newSid) {
+                  Write-Host "::warning::El SID del usuario RDP cambió ($oldSid -> $newSid): las sesiones guardadas con DPAPI (Chrome, Edge, credenciales de Windows) no se podrán descifrar."
+              } else {
+                  Write-Host "El SID del usuario RDP es el mismo que en la copia anterior."
+              }
+              if ($env:RDP_PW_FIXED -ne "1") {
+                  Write-Host "::notice::Contraseña aleatoria en cada ejecución: las sesiones guardadas con DPAPI no se descifrarán. Define el secreto RDP_PASSWORD para usar una fija."
+              }
+          }
+
+          # Configuración del usuario RDP (programas, imagen de fondo, colores):
+          # se carga su NTUSER.DAT y se importan todos los .reg guardados
+          $regDir = "C:\Datos\.apps\registry"
           $nt = "C:\Users\RDP\NTUSER.DAT"
-          if ($restoreOk -and (Test-Path $regFile)) {
+          if ($restoreOk -and (Test-Path $regDir)) {
               if (Test-Path $nt) {
                   Write-Host "Restaurando configuración del usuario RDP..."
                   reg load HKU\RDP_RESTORE $nt 2>$null | Out-Null
                   if ($LASTEXITCODE -eq 0) {
-                      reg import $regFile 2>$null | Out-Null
-                      Write-Host "Configuración importada (código $LASTEXITCODE)."
+                      foreach ($rf in Get-ChildItem $regDir -Filter *.reg -ErrorAction SilentlyContinue) {
+                          reg import $rf.FullName 2>$null | Out-Null
+                          Write-Host "Importado $($rf.Name) (código $LASTEXITCODE)."
+                      }
                       [gc]::Collect(); Start-Sleep 2
                       reg unload HKU\RDP_RESTORE 2>$null | Out-Null
                   } else {
@@ -752,7 +793,7 @@ jobs:
           if (-not $pw -and (Test-Path "C:\rdp-password.txt")) {
               $pw = (Get-Content "C:\rdp-password.txt" -Raw).Trim()
           }
-          Write-Host "DEBUG: contraseña disponible = $([bool]$pw); longitud = $($pw.Length)"
+          Write-Host "DEBUG: contraseña disponible = $([bool]$pw)"
 
           "## Conexión RDP" | Out-File $out -Append -Encoding utf8
           if ($env:TS_IP) {
@@ -765,7 +806,9 @@ jobs:
           "- Puerto: ``3389`` (RDP con NLA)" | Out-File $out -Append -Encoding utf8
           "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
           "- Contraseña:" | Out-File $out -Append -Encoding utf8
-          if ($pw) {
+          if ($env:RDP_PW_FIXED -eq "1") {
+              "La que guardaste en el secreto ``RDP_PASSWORD``." | Out-File $out -Append -Encoding utf8
+          } elseif ($pw) {
               '````' | Out-File $out -Append -Encoding utf8
               $pw | Out-File $out -Append -Encoding utf8
               '````' | Out-File $out -Append -Encoding utf8
