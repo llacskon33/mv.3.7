@@ -1,0 +1,25 @@
+It failed because the ISO download step got blocked with HTTP 403 from SourceForge, so curl exited with code 22 and stopped the job.
+Failing part in the logs
+
+In the step that runs:
+bash
+
+curl -L --fail --retry 3 -A "Mozilla/5.0" -o bliss.iso "$ISO_URL" \
+  || curl -L --fail --retry 3 -A "Mozilla/5.0" -o bliss.iso "https://cytranet-dal.dl.sourceforge.net/..."
+
+both URLs return:
+
+    curl: (22) The requested URL returned error: 403
+    then: ##[error]Process completed with exit code 22.
+
+So the workflow never got a valid ISO file.
+Where to look
+
+    Workflow file: .github/workflows/main.yml
+    Run/job URL you shared:
+    https://github.com/llacskon33/mv.3.7/actions/runs/40568433382/job/122415838246
+
+Suggested fix
+
+Use a download source that allows non-browser CI access (direct mirror/CDN with stable URL), or add a pre-step that resolves the final downloadable link before calling curl.
+If you want, I can help rewrite that download step to be more robust in GitHub Actions (with mirror fallback + content-type/size validation).
