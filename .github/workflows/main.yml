@@ -23,6 +23,10 @@ on:
         description: "Cuántas copias completas conservar en Releases (mínimo 1)"
         type: number
         default: 2
+      liberar:
+        description: "Liberar espacio en segundo plano (borra Visual Studio, Android, bases de datos, etc. del runner)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -206,6 +210,194 @@ jobs:
                   New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
                   [IO.File]::WriteAllText((Join-Path $dstDir $name), $txt, [Text.Encoding]::Unicode)
                   Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                  Write-Host "[backup] Guardado del registro del usuario RDP: $sub"
+              } else {
+                  Write-Host "[backup] No se pudo exportar del usuario RDP: $sub"
+              }
+              $global:LASTEXITCODE = 0
+          }
+
+          # Sube archivos con reintentos. Devuelve $true solo si todos subieron.
+          function Upload-Retry($tag, $paths) {
+              foreach ($p in $paths) {
+                  $ok = $false
+                  for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+                      gh release upload $tag $p --clobber 2>&1 | Out-Host
+                      if ($LASTEXITCODE -eq 0) { $ok = $true }
+                      else { Write-Host "[backup] Reintento $i de $(Split-Path $p -Leaf)"; Start-Sleep 15 }
+                  }
+                  if (-not $ok) { return $false }
+              }
+              return $true
+          }
+
+          Save-New "C:\Program Files" "C:\baseline-pf.txt" "$prog\PF"
+          Save-New "C:\Program Files (x86)" "C:\baseline-pf86.txt" "$prog\PF86"
+
+          $lp = "C:\Users\RDP\AppData\Local\Programs"
+          if (Test-Path $lp) {
+              Remove-Item "$prog\Local" -Recurse -Force -ErrorAction SilentlyContinue
+              Get-ChildItem $lp -Directory | ForEach-Object {
+                  Copy-Capped $_.FullName "$prog\Local\$($_.Name)"
+              }
+          }
+
+          if (Test-Path "C:\baseline-choco.txt") {
+              $base = @(Get-Content "C:\baseline-choco.txt")
+              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object Name
+              @($now | Where-Object { $_ -notin $base }) | Sort-Object | Set-Content "$appsDir\choco-packages.txt"
+          }
+          if (Test-Path "C:\baseline-registry.txt") {
+              $baseReg = @(Get-Content "C:\baseline-registry.txt")
+              $paths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                       'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                       'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              $nowReg = Get-ItemProperty $paths -ErrorAction SilentlyContinue | Where-Object DisplayName | ForEach-Object DisplayName
+              $prev = @()
+              if (Test-Path "$appsDir\programas-instalados.txt") { $prev = @(Get-Content "$appsDir\programas-instalados.txt") }
+              @(@($nowReg | Where-Object { $_ -notin $baseReg }) + $prev) | Where-Object { $_ } | Sort-Object -Unique |
+                Set-Content "$appsDir\programas-instalados.txt"
+          }
+
+          # Guardar configuración del usuario RDP (programas, imagen de fondo y colores) y lista de paquetes winget
+          Save-RdpRegistry "$appsDir\registry"
+          Save-RdpRegistry "$appsDir\registry" "Control Panel\Desktop" "rdp-desktop.reg"
+          Save-RdpRegistry "$appsDir\registry" "Control Panel\Colors"  "rdp-colors.reg"
+          # SID del usuario RDP: al restaurar se compara para saber si las sesiones cifradas (DPAPI) pueden funcionar
+          $uSid = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($uSid) {
+              New-Item -ItemType Directory -Path "$appsDir\registry" -Force | Out-Null
+              $uSid.SID.Value | Set-Content "$appsDir\registry\rdp-sid.txt"
+          }
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+              winget export -o "$appsDir\winget-packages.json" --include-versions 2>$null | Out-Null
+          }
+
+          # Guardar configuración de Sunshine (móviles emparejados, claves, ajustes)
+          $sunCfg = "C:\Program Files\Sunshine\config"
+          if (Test-Path $sunCfg) {
+              robocopy $sunCfg "$appsDir\sunshine-config" /E /XF "*.log" /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+              $global:LASTEXITCODE = 0
+          }
+
+          $dst = "D:\_rdp_backup"
+          if (-not (Test-Path "D:\")) { $dst = "C:\_rdp_backup" }
+          Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $datosPath = if (Test-Path "D:\Datos") { "D:\Datos" } else { "C:\Datos" }
+          $bad = $false
+
+          & $7z a -t7z -mx=1 -v1900m -ssw "$dst\datos.7z" $datosPath | Out-Null
+          if ($LASTEXITCODE -ge 2) { $bad = $true }
+
+          if (Test-Path "C:\Users\RDP") {
+              & $7z a -t7z -mx=1 -v1900m -ssw "$dst\profile.7z" "C:\Users\RDP" `
+                  "-xr!NTUSER.DAT*" "-xr!UsrClass.dat*" "-xr!Temp" "-xr!INetCache" `
+                  "-xr!Cache" "-xr!Code Cache" "-xr!GPUCache" "-xr!CacheStorage" "-xr!Crashpad" `
+                  "-x!RDP\AppData\Local\Programs" | Out-Null
+              if ($LASTEXITCODE -ge 2) { $bad = $true }
+          }
+
+          if (Test-Path "D:\") {
+              $extra = Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+                       Where-Object { $_.Name -notin $skip } | ForEach-Object FullName
+              if ($extra) {
+                  & $7z a -t7z -mx=1 -v1900m -ssw "$dst\dextra.7z" @extra | Out-Null
+                  if ($LASTEXITCODE -ge 2) { $bad = $true }
+              }
+          }
+          if ($bad) {
+              Write-Host "[backup] Error al comprimir: se conserva la copia anterior."
+              Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+              exit 1
+          }
+
+          # Sumas de control para poder verificar la copia al restaurarla
+          $sums = Get-ChildItem $dst -File | ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)"
+          }
+          $sums | Set-Content "$dst\SHA256SUMS.txt"
+
+          $files = Get-ChildItem $dst -File | ForEach-Object FullName
+          if (-not $files) { Write-Host "[backup] Nada que guardar."; exit 0 }
+          $gb = [math]::Round(((Get-ChildItem $dst -File | Measure-Object Length -Sum).Sum)/1GB,2)
+          Write-Host "[backup] Copia lista: $($files.Count) archivos, $gb GB. Subiendo..."
+
+          $tag = "$prefix$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          gh release create $tag --title $tag --notes "Copia automática del escritorio remoto" --latest=false
+          if ($LASTEXITCODE -ne 0) { Write-Host "[backup] No se pudo crear la Release."; exit 1 }
+
+          $upOk = Upload-Retry $tag $files
+          if ($upOk) {
+              # Verificar que todo lo subido existe y pesa lo mismo que en local
+              $remote = gh release view $tag --json assets 2>$null | ConvertFrom-Json
+              foreach ($f in Get-ChildItem $dst -File) {
+                  $r = $remote.assets | Where-Object { $_.name -eq $f.Name }
+                  if (-not $r -or $r.size -ne $f.Length) {
+                      Write-Host "[backup] Verificación fallida: $($f.Name)"
+                      $upOk = $false
+                  }
+              }
+          }
+          if (-not $upOk) {
+              Write-Host "[backup] La subida falló: se conserva la copia anterior."
+              gh release delete $tag --yes --cleanup-tag
+              Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+              exit 1
+          }
+
+          "ok" | Set-Content "$dst\complete.flag"
+          if (-not (Upload-Retry $tag @("$dst\complete.flag"))) {
+              gh release delete $tag --yes --cleanup-tag
+              Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+              exit 1
+          }
+
+          # Conservar las N copias más recientes (la nueva incluida) y borrar el resto
+          $all = gh release list --limit 100 --json tagName,createdAt 2>$null | ConvertFrom-Json |
+                 Where-Object { $_.tagName -like "$prefix*" } | Sort-Object createdAt -Descending
+          foreach ($o in ($all | Select-Object -Skip $keep)) {
+              gh release delete $o.tagName --yes --cleanup-tag
+          }
+
+          Set-Content "C:\last-sig.txt" $sig
+          Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "[backup] Copia guardada en la Release $tag (se conservan $keep)."
+          exit 0
+          '@
+          Set-Content -Path "C:\backup.ps1" -Value $script -Encoding utf8
+
+      - name: Record baseline (apps del runner)
+        shell: pwsh
+        run: |
+          Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object |
+            Set-Content "C:\baseline-choco.txt"
+
+          Get-ChildItem "C:\Program Files" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-pf.txt"
+          Get-ChildItem "C:\Program Files (x86)" -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-pf86.txt"
+
+          $paths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+            Where-Object DisplayName |
+            ForEach-Object DisplayName | Sort-Object -Unique |
+            Set-Content "C:\baseline-registry.txt"
+
+      - name: Free disk space (en segundo plano)
+        if: ${{ inputs.liberar }}
+        shell: pwsh
+        run: |
+          $cleanup = @'
+          $log = "C:\cleanup.log"
+          "inicio: $([math]::Round((Get-PSDrive C).Free/1GB,1)) GB libres" | Add-Content $log
+
+          # 1) Parar y eliminar los servicios de lo que se va a borrar
+          Get-Service -ErrorAction SilentlyContinue |
+            WhSilentlyContinue
                   Write-Host "[backup] Guardado del registro del usuario RDP: $sub"
               } else {
                   Write-Host "[backup] No se pudo exportar del usuario RDP: $sub"
