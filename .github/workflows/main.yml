@@ -152,6 +152,12 @@ jobs:
               }
           }
           $lines += Get-ChildItem "C:\Program Files","C:\Program Files (x86)","C:\ProgramData\chocolatey\lib" -Directory -Name -ErrorAction SilentlyContinue
+          # Apps registradas (instaladores .exe/.msi que no crean carpeta nueva) y servicios también cuentan como cambio
+          $uninstPaths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          $lines += @(Get-ItemProperty $uninstPaths -ErrorAction SilentlyContinue | Where-Object DisplayName | ForEach-Object { "app|$($_.DisplayName)|$($_.DisplayVersion)" })
+          $lines += @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object { "svc|$($_.Name)" })
           # Sunshine: si cambia el estado (nuevos móviles emparejados), cuenta como cambio
           $sunState = "C:\Program Files\Sunshine\config\sunshine_state.json"
           if (Test-Path $sunState) { $lines += "sunshine|" + (Get-FileHash $sunState -Algorithm SHA256).Hash }
@@ -177,12 +183,12 @@ jobs:
               robocopy $src $dst /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
               $global:LASTEXITCODE = 0
           }
-          function Save-New($srcRoot, $baseFile, $dstRoot) {
+          function Save-New($srcRoot, $baseFile, $dstRoot, $exclude = @()) {
               if (-not (Test-Path $baseFile)) { return }
               Remove-Item $dstRoot -Recurse -Force -ErrorAction SilentlyContinue
               $base = @(Get-Content $baseFile)
-              Get-ChildItem $srcRoot -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notin $base -and $_.Name -ne 'Tailscale' -and $_.Name -ne 'Sunshine' } |
+              Get-ChildItem $srcRoot -Directory -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notin $base -and $_.Name -ne 'Tailscale' -and $_.Name -ne 'Sunshine' -and $_.Name -notin $exclude } |
                 ForEach-Object { Copy-Capped $_.FullName (Join-Path $dstRoot $_.Name) }
           }
 
@@ -237,6 +243,7 @@ jobs:
 
           Save-New "C:\Program Files" "C:\baseline-pf.txt" "$prog\PF"
           Save-New "C:\Program Files (x86)" "C:\baseline-pf86.txt" "$prog\PF86"
+          Save-New "C:\ProgramData" "C:\baseline-pd.txt" "$prog\PD" @('Package Cache','regid.1991-06.com.microsoft','SoftwareDistribution','USOPrivate','USOShared','Microsoft')
 
           $lp = "C:\Users\RDP\AppData\Local\Programs"
           if (Test-Path $lp) {
@@ -249,7 +256,81 @@ jobs:
           if (Test-Path "C:\baseline-choco.txt") {
               $base = @(Get-Content "C:\baseline-choco.txt")
               $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object Name
-              @($now | Where-Object { $_ -notin $base }) | Sort-Object | Set-Content "$appsDir\choco-packages.txt"
+              # La lista se ACUMULA: un paquete que falle al reinstalarse una vez no se pierde para siempre.
+              # (Para quitar uno a propósito, edita C:\Datos\.apps\choco-packages.txt.)
+              $prevChoco = @()
+              if (Test-Path "$appsDir\choco-packages.txt") { $prevChoco = @(Get-Content "$appsDir\choco-packages.txt") }
+              @(@($now | Where-Object { $_ -notin $base }) + $prevChoco) | Where-Object { $_ -and $_.Trim() } |
+                Sort-Object -Unique | Set-Content "$appsDir\choco-packages.txt"
+          }
+
+          # --- Claves "Uninstall" y de fabricante en HKLM de las apps nuevas: así Windows las ve como instaladas ---
+          $hklmDir = "$appsDir\hklm"
+          Remove-Item $hklmDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $hklmDir -Force | Out-Null
+          if (Test-Path "C:\baseline-registry.txt") {
+              $baseReg2 = @(Get-Content "C:\baseline-registry.txt")
+              $n = 0
+              foreach ($rp in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+                  foreach ($k in Get-ChildItem $rp -ErrorAction SilentlyContinue) {
+                      $dn = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue).DisplayName
+                      if (-not $dn -or $dn -in $baseReg2 -or $dn -match 'Tailscale|Sunshine') { continue }
+                      $n++
+                      reg export "$($k.Name)" "$hklmDir\uninstall-$n.reg" /y 2>$null | Out-Null
+                  }
+              }
+              foreach ($d in @(Get-ChildItem "$prog\PF","$prog\PF86" -Directory -ErrorAction SilentlyContinue)) {
+                  foreach ($root in @('SOFTWARE','SOFTWARE\WOW6432Node')) {
+                      if (Test-Path -LiteralPath "Registry::HKEY_LOCAL_MACHINE\$root\$($d.Name)") {
+                          $n++
+                          reg export "HKLM\$root\$($d.Name)" "$hklmDir\vendor-$n.reg" /y 2>$null | Out-Null
+                      }
+                  }
+              }
+              Write-Host "[backup] Claves de registro de apps guardadas: $n"
+              $global:LASTEXITCODE = 0
+          }
+
+          # --- Servicios nuevos de apps (se recrean al restaurar) ---
+          if (Test-Path "C:\baseline-services.txt") {
+              $baseSvc = @(Get-Content "C:\baseline-services.txt")
+              $svcs = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -notin $baseSvc -and $_.PathName -and $_.PathName -notmatch '(?i)\\Windows\\|tailscale|sunshine' } |
+                  ForEach-Object { [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; PathName = $_.PathName; StartMode = $_.StartMode; StartName = $_.StartName } })
+              ConvertTo-Json -InputObject @($svcs) -Depth 3 | Set-Content "$appsDir\services.json" -Encoding utf8
+              Write-Host "[backup] Servicios de apps guardados: $($svcs.Count)"
+          }
+
+          # --- Accesos directos (menú Inicio común y escritorio público) ---
+          $smRoot = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+          $smDst = "$appsDir\startmenu"
+          Remove-Item $smDst -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path "C:\baseline-startmenu.txt") {
+              $baseSm = @(Get-Content "C:\baseline-startmenu.txt")
+              Get-ChildItem $smRoot -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                  $rel = $_.FullName.Substring($smRoot.Length).TrimStart('\')
+                  if ($rel -notin $baseSm -and $rel -notmatch 'Tailscale|Sunshine') {
+                      $t = Join-Path $smDst $rel
+                      New-Item -ItemType Directory -Path (Split-Path $t) -Force | Out-Null
+                      Copy-Item -LiteralPath $_.FullName -Destination $t -Force
+                  }
+              }
+          }
+          $pdDst = "$appsDir\publicdesktop"
+          Remove-Item $pdDst -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path "C:\Users\Public\Desktop") {
+              New-Item -ItemType Directory -Path $pdDst -Force | Out-Null
+              Get-ChildItem "C:\Users\Public\Desktop" -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in '.lnk','.url' -and $_.Name -notmatch 'Tailscale|Sunshine' } |
+                ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $pdDst -Force }
+          }
+
+          # --- Entradas nuevas del PATH del sistema ---
+          if (Test-Path "C:\baseline-path.txt") {
+              $basePath = @(Get-Content "C:\baseline-path.txt")
+              $nowPath = @([Environment]::GetEnvironmentVariable('Path','Machine') -split ';' | Where-Object { $_ })
+              @($nowPath | Where-Object { $_ -notin $basePath -and $_ -notmatch 'Tailscale|Sunshine' }) | Sort-Object -Unique |
+                Set-Content "$appsDir\path-extra.txt"
           }
           if (Test-Path "C:\baseline-registry.txt") {
               $baseReg = @(Get-Content "C:\baseline-registry.txt")
@@ -274,7 +355,10 @@ jobs:
               $uSid.SID.Value | Set-Content "$appsDir\registry\rdp-sid.txt"
           }
           if (Get-Command winget -ErrorAction SilentlyContinue) {
-              winget export -o "$appsDir\winget-packages.json" --include-versions 2>$null | Out-Null
+              winget export -o "$appsDir\winget-packages.json" --include-versions --accept-source-agreements 2>&1 | Out-Host
+              $global:LASTEXITCODE = 0
+          } else {
+              Write-Host "[backup] winget no está disponible en este runner: no se guarda lista de winget (usa choco para que se reinstalen)."
           }
 
           # Guardar configuración de Sunshine (móviles emparejados, claves, ajustes)
@@ -426,6 +510,18 @@ jobs:
             Where-Object DisplayName |
             ForEach-Object DisplayName | Sort-Object -Unique |
             Set-Content "C:\baseline-registry.txt"
+
+          # Líneas base extra: ProgramData, servicios, accesos del menú Inicio y PATH del sistema
+          Get-ChildItem "C:\ProgramData" -Directory -Force -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-pd.txt"
+          Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+            ForEach-Object Name | Sort-Object | Set-Content "C:\baseline-services.txt"
+          $sm = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+          Get-ChildItem $sm -Recurse -File -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName.Substring($sm.Length).TrimStart('\') } | Sort-Object |
+            Set-Content "C:\baseline-startmenu.txt"
+          ([Environment]::GetEnvironmentVariable('Path','Machine') -split ';') | Where-Object { $_ } |
+            Sort-Object -Unique | Set-Content "C:\baseline-path.txt"
 
       - name: Free disk space (en segundo plano)
         if: ${{ inputs.liberar }}
@@ -629,6 +725,7 @@ jobs:
               foreach ($m in @(
                   @{ S = "$prog\PF";    D = "C:\Program Files" },
                   @{ S = "$prog\PF86";  D = "C:\Program Files (x86)" },
+                  @{ S = "$prog\PD";    D = "C:\ProgramData" },
                   @{ S = "$prog\Local"; D = "C:\Users\RDP\AppData\Local\Programs" }
               )) {
                   if (Test-Path $m.S) {
@@ -639,21 +736,135 @@ jobs:
               }
           }
 
-          $chocoList = "C:\Datos\.apps\choco-packages.txt"
-          if ($restoreOk -and (Test-Path $chocoList)) {
-              $pkgs = @(Get-Content $chocoList -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
-              foreach ($p in $pkgs) {
-                  Write-Host "choco install $p"
-                  choco install $p -y --no-progress | Out-Null
-                  $global:LASTEXITCODE = 0
+          $appsDir = "C:\Datos\.apps"
+          $rep = New-Object System.Collections.Generic.List[string]
+
+          # --- Registro de apps (HKLM), PATH, servicios y accesos directos ---
+          if ($restoreOk) {
+              $hk = Join-Path $appsDir "hklm"
+              if (Test-Path $hk) {
+                  $imp = 0; $bad = 0
+                  foreach ($rf in Get-ChildItem $hk -Filter *.reg -ErrorAction SilentlyContinue) {
+                      reg import $rf.FullName 2>&1 | Out-Null
+                      if ($LASTEXITCODE -eq 0) { $imp++ } else { $bad++; Write-Host "::warning::No se pudo importar $($rf.Name)" }
+                  }
+                  Write-Host "Claves HKLM de apps importadas: $imp (fallidas: $bad)"
               }
+
+              $pe = Join-Path $appsDir "path-extra.txt"
+              if (Test-Path $pe) {
+                  $curL = @([Environment]::GetEnvironmentVariable('Path','Machine') -split ';' | Where-Object { $_ })
+                  $add = @(Get-Content $pe | Where-Object { $_ -and $_ -notin $curL })
+                  if ($add.Count) {
+                      [Environment]::SetEnvironmentVariable('Path', (($curL + $add) -join ';'), 'Machine')
+                      Write-Host "PATH del sistema ampliado con $($add.Count) entradas."
+                  }
+              }
+
+              $sj = Join-Path $appsDir "services.json"
+              if (Test-Path $sj) {
+                  foreach ($s in @(Get-Content $sj -Raw | ConvertFrom-Json)) {
+                      if (-not $s.Name) { continue }
+                      if (Get-Service -Name $s.Name -ErrorAction SilentlyContinue) { continue }
+                      try {
+                          $mode = switch ($s.StartMode) { 'Auto' { 'Automatic' } 'Disabled' { 'Disabled' } default { 'Manual' } }
+                          $disp = if ($s.DisplayName) { $s.DisplayName } else { $s.Name }
+                          New-Service -Name $s.Name -BinaryPathName $s.PathName -DisplayName $disp -StartupType $mode -ErrorAction Stop | Out-Null
+                          if ($mode -eq 'Automatic') { Start-Service -Name $s.Name -ErrorAction SilentlyContinue }
+                          Write-Host "Servicio recreado: $($s.Name)"
+                      } catch {
+                          Write-Host "::warning::No se pudo recrear el servicio $($s.Name): $($_.Exception.Message)"
+                          $rep.Add("Servicio no recreado: $($s.Name)")
+                      }
+                  }
+              }
+
+              $smSrc = Join-Path $appsDir "startmenu"
+              if (Test-Path $smSrc) {
+                  robocopy $smSrc "C:\ProgramData\Microsoft\Windows\Start Menu\Programs" /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+              }
+              $pdSrc = Join-Path $appsDir "publicdesktop"
+              if (Test-Path $pdSrc) {
+                  robocopy $pdSrc "C:\Users\Public\Desktop" /E /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+              }
+              $global:LASTEXITCODE = 0
           }
 
+          # --- Chocolatey: instala con log, reintento y resumen de fallos ---
+          function Install-Choco($p) {
+              for ($i = 1; $i -le 2; $i++) {
+                  $o = choco install $p -y --no-progress --limit-output 2>&1
+                  $ec = $LASTEXITCODE
+                  if ($ec -in 0, 1641, 3010) { return $true }
+                  Write-Host "::warning::choco install $p falló (código $ec, intento $i)"
+                  $o | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" }
+                  Start-Sleep 5
+              }
+              return $false
+          }
+
+          $chocoList = "C:\Datos\.apps\choco-packages.txt"
+          if ($restoreOk -and (Test-Path $chocoList)) {
+              if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+                  Write-Host "::warning::choco no está disponible en este runner: no se reinstalan los paquetes."
+                  $rep.Add("choco no disponible: paquetes sin reinstalar")
+              } else {
+                  $pkgs = @(Get-Content $chocoList -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() })
+                  Write-Host "Reinstalando $($pkgs.Count) paquetes de Chocolatey..."
+                  $okN = 0
+                  foreach ($p in $pkgs) {
+                      Write-Host "choco install $p"
+                      if (Install-Choco $p) { $okN++ } else { $rep.Add("choco falló: $p") }
+                  }
+                  Write-Host "Chocolatey: $okN de $($pkgs.Count) paquetes correctos."
+                  $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+              }
+              $global:LASTEXITCODE = 0
+          }
+
+          # --- winget: si no existe en el runner, se intenta instalarlo (best-effort) ---
           $wingetJson = "C:\Datos\.apps\winget-packages.json"
           if ($restoreOk -and (Test-Path $wingetJson)) {
-              Write-Host "Reinstalando paquetes winget..."
-              winget import -i $wingetJson --accept-package-agreements --accept-source-agreements --ignore-versions 2>$null | Out-Null
+              if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                  Write-Host "winget no está en el runner: intentando instalarlo..."
+                  try {
+                      powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Install-PackageProvider NuGet -Force | Out-Null; Install-Module Microsoft.WinGet.Client -Force -Scope AllUsers -Repository PSGallery | Out-Null; Import-Module Microsoft.WinGet.Client; Repair-WinGetPackageManager -AllUsers" 2>&1 | Out-Host
+                  } catch { Write-Host "::warning::Fallo al preparar winget: $($_.Exception.Message)" }
+                  $env:Path += ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              }
+              if (Get-Command winget -ErrorAction SilentlyContinue) {
+                  Write-Host "Reinstalando paquetes winget..."
+                  winget import -i $wingetJson --accept-package-agreements --accept-source-agreements --ignore-versions --disable-interactivity 2>&1 | Out-Host
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Host "::warning::winget import terminó con código $LASTEXITCODE"
+                      $rep.Add("winget import con errores (código $LASTEXITCODE)")
+                  }
+              } else {
+                  Write-Host "::warning::winget no está disponible: no se reinstalan los paquetes de winget."
+                  $rep.Add("winget no disponible: paquetes sin reinstalar")
+              }
               $global:LASTEXITCODE = 0
+          }
+
+          # --- Informe: apps guardadas que siguen sin aparecer como instaladas ---
+          $listFile = "C:\Datos\.apps\programas-instalados.txt"
+          if ($restoreOk -and (Test-Path $listFile)) {
+              $uPaths = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              $nowNames = @(Get-ItemProperty $uPaths -ErrorAction SilentlyContinue | Where-Object DisplayName | ForEach-Object DisplayName)
+              $userReg = ""
+              $ur = "C:\Datos\.apps\registry\rdp-software.reg"
+              if (Test-Path $ur) { $userReg = [IO.File]::ReadAllText($ur, [Text.Encoding]::Unicode) }
+              $saved = @(Get-Content $listFile | Where-Object { $_ })
+              $missing = @($saved | Where-Object { $_ -notin $nowNames -and -not $userReg.Contains($_) })
+              $out = $env:GITHUB_STEP_SUMMARY
+              "## Restauración de apps" | Out-File $out -Append -Encoding utf8
+              "- Apps guardadas: $($saved.Count); registradas tras restaurar: $($saved.Count - $missing.Count)" | Out-File $out -Append -Encoding utf8
+              if ($missing.Count) {
+                  "- **Sin registrar** (reinstálalas; si usas choco quedarán guardadas):" | Out-File $out -Append -Encoding utf8
+                  $missing | ForEach-Object { "  - $_" | Out-File $out -Append -Encoding utf8; Write-Host "::warning::App sin restaurar: $_" }
+              }
+              $rep | ForEach-Object { "- $_" | Out-File $out -Append -Encoding utf8 }
           }
 
           # Aviso sobre sesiones cifradas (DPAPI): solo pueden funcionar si el SID del usuario RDP no ha cambiado
