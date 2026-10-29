@@ -355,7 +355,30 @@ jobs:
               $uSid.SID.Value | Set-Content "$appsDir\registry\rdp-sid.txt"
           }
           if (Get-Command winget -ErrorAction SilentlyContinue) {
-              winget export -o "$appsDir\winget-packages.json" --include-versions --accept-source-agreements 2>&1 | Out-Host
+              $wgFull = Join-Path $env:TEMP "winget-full.json"
+              Remove-Item $wgFull -Force -ErrorAction SilentlyContinue
+              winget export -o $wgFull --include-versions --accept-source-agreements 2>&1 | Out-Host
+              $global:LASTEXITCODE = 0
+              if (Test-Path $wgFull) {
+                  # Se guardan SOLO los paquetes que no estaban en el runner (línea base de winget)
+                  $wgBase = @()
+                  if (Test-Path "C:\baseline-winget.txt") { $wgBase = @(Get-Content "C:\baseline-winget.txt" | Where-Object { $_ }) }
+                  $wgOut = "$appsDir\winget-packages.json"
+                  if ($wgBase.Count -eq 0) {
+                      Write-Host "[backup] Sin línea base de winget: no se guarda la lista de winget (evita reinstalar apps del runner)."
+                  } else {
+                      $wg = Get-Content $wgFull -Raw | ConvertFrom-Json
+                      $nNew = 0
+                      foreach ($src in @($wg.Sources)) {
+                          $src.Packages = @($src.Packages | Where-Object { $_.PackageIdentifier -notin $wgBase })
+                          $nNew += $src.Packages.Count
+                      }
+                      $wg.Sources = @($wg.Sources | Where-Object { $_.Packages.Count -gt 0 })
+                      $wg | ConvertTo-Json -Depth 8 | Set-Content $wgOut -Encoding utf8
+                      Write-Host "[backup] winget: $nNew paquetes nuevos guardados (los del runner se omiten)."
+                  }
+              }
+              Remove-Item $wgFull -Force -ErrorAction SilentlyContinue
               $global:LASTEXITCODE = 0
           } else {
               Write-Host "[backup] winget no está disponible en este runner: no se guarda lista de winget (usa choco para que se reinstalen)."
@@ -522,6 +545,21 @@ jobs:
             Set-Content "C:\baseline-startmenu.txt"
           ([Environment]::GetEnvironmentVariable('Path','Machine') -split ';') | Where-Object { $_ } |
             Sort-Object -Unique | Set-Content "C:\baseline-path.txt"
+
+          # Línea base de winget: paquetes que ya trae el runner (para no guardarlos ni reinstalarlos)
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+              $wgb = Join-Path $env:TEMP "winget-base.json"
+              Remove-Item $wgb -Force -ErrorAction SilentlyContinue
+              winget export -o $wgb --accept-source-agreements 2>&1 | Out-Null
+              if (Test-Path $wgb) {
+                  try {
+                      @((Get-Content $wgb -Raw | ConvertFrom-Json).Sources.Packages.PackageIdentifier) |
+                        Where-Object { $_ } | Sort-Object -Unique | Set-Content "C:\baseline-winget.txt"
+                  } catch { Write-Host "::warning::No se pudo leer la línea base de winget." }
+                  Remove-Item $wgb -Force -ErrorAction SilentlyContinue
+              }
+          }
+          $global:LASTEXITCODE = 0
 
       - name: Free disk space (en segundo plano)
         if: ${{ inputs.liberar }}
@@ -1272,3 +1310,4 @@ jobs:
           }
 
           $global:LASTEXITCODE = 0
+          
