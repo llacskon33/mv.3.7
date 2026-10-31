@@ -865,9 +865,19 @@ jobs:
                   $pkgs = @($pkgs | Where-Object { $_ -notin $skipped })
                   Write-Host "Reinstalando $($pkgs.Count) paquetes de Chocolatey..."
                   $okN = 0
-                  foreach ($p in $pkgs) {
-                      Write-Host "choco install $p"
-                      if (Install-Choco $p) { $okN++ } else { $rep.Add("choco falló: $p") }
+                  if ($pkgs.Count -gt 0) {
+                      Write-Host "choco install $($pkgs -join ' ')"
+                      $o = choco install $pkgs -y --no-progress --limit-output 2>&1
+                      $ec = $LASTEXITCODE
+                      if ($ec -in 0, 1641, 3010) {
+                          $okN = $pkgs.Count
+                      } else {
+                          Write-Host "::warning::La instalación en lote de Chocolatey falló (código $ec); se reintenta cada paquete."
+                          $o | Select-Object -Last 8 | ForEach-Object { Write-Host "    $_" }
+                          foreach ($p in $pkgs) {
+                              if (Install-Choco $p) { $okN++ } else { $rep.Add("choco falló: $p") }
+                          }
+                      }
                   }
                   Write-Host "Chocolatey: $okN de $($pkgs.Count) paquetes correctos."
                   $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
